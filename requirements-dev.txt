@@ -1,0 +1,4 @@
+# Testing & Code Quality Dependencies
+pytest>=8.0.0
+pytest-cov>=5.0.0
+flake8>=7.0.0
