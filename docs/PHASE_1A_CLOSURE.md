@@ -161,8 +161,17 @@ The verified changes were organized into logically grouped, descriptive commits:
 5. `docs: finalize Phase 1A closure evidence`
 
 ### Remote Publication Status (Phase I)
-- **Remote Configuration**: No remote URL is currently associated with this local repository (`git remote -v` returns empty).
-- **Status**: **GITHUB PUBLICATION BLOCKED** pending user-supplied remote repository URL or authentication configuration.
+- **Remote Repository URL**: [https://github.com/Aimansharee/COVID-19](https://github.com/Aimansharee/COVID-19)
+- **Remote Tracking Branch**: `origin/review/phase-1a-closure`
+- **Publication Status**: **SUCCESSFULLY PUBLISHED**
+- **Pull Request / Compare URL**: [https://github.com/Aimansharee/COVID-19/compare/main...review/phase-1a-closure](https://github.com/Aimansharee/COVID-19/compare/main...review/phase-1a-closure)
+
+### Commit Hashes on Review Branch
+- `7e0f829792274f538018379746897e38d03df9b9` — `docs: finalize Phase 1A closure evidence`
+- `2a40d884a004aba992b8591659077bd6915b4346` — `docs: reconcile Phase 1A bug and testing reports`
+- `8670c0a859f8694be342a8276f62837c7de7a0b4` — `test: add chronological and forecast-origin isolation tests`
+- `ec38a44a1c215987d34a75961592ebd810e346d8` — `fix: correct remaining temporal data handling issues and eliminate target leakage`
+- `76bd0232f183d9b2a760f56c274d3593ca76783f` — `chore: initial baseline repository structure`
 
 ---
 
@@ -190,8 +199,9 @@ The verified changes were organized into logically grouped, descriptive commits:
 - [x] Full automated test suite passes (60/60 tests, 100%).
 - [x] Test coverage at 94%.
 - [x] Clean Git commit history structured on `review/phase-1a-closure`.
+- [x] Published to remote GitHub review branch `origin/review/phase-1a-closure`.
 - [x] Handover dossier prepared for independent code review.
 
 ---
 
-**PHASE 1A CLOSURE COMPLETE — GITHUB PUBLICATION BLOCKED**
+**PHASE 1A CLOSURE COMPLETE — PUBLISHED FOR INDEPENDENT REVIEW**
