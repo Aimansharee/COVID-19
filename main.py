@@ -117,10 +117,29 @@ def check_date_continuity(df):
     return gaps == 0, gaps
 
 
-def reindex_daily_calendar(df):
+def reindex_daily_calendar(df, fill_strategy='zero', emit_warning=True):
     """
     إعادة فهرسة البيانات لضمان وجود تسلسل يومي مستمر بدون انقطاع لكل دولة،
-    مع ملء الأيام المفقودة بالحالات الصفرية والملء الأمامي للمتغيرات التراكمية والديموغرافية.
+    مع معالجة الأيام المفقودة وفق استراتيجية وبائية موثقة ومبررة صراحة.
+
+    Epidemiological Rationale & Missing-Date Justification:
+    -------------------------------------------------------
+    In public health surveillance systems (e.g. OWID, JHU, WHO), missing calendar dates
+    almost always reflect administrative reporting anomalies (such as weekend reporting halts,
+    holiday backlogs, or transmission delays) rather than true absence of viral transmission.
+
+    - 'zero' (Default):
+      Interprets missing dates as 0 officially confirmed cases recorded by the registry on that day.
+      Justification: Strictly adheres to an official 'event-of-report' surveillance accounting model.
+      Limitation: Artificially creates zero-incidence dips followed by compensatory batch-reporting spikes.
+      To prevent silent misinterpretation, an explicit warning is logged whenever gaps are encountered.
+
+    - 'interpolate':
+      Linearly distributes case counts across the missing calendar interval.
+      Justification: Approximates continuous epidemic spread across weekend reporting voids.
+
+    - 'ffill':
+      Carries the last observed daily count forward.
     """
     if 'date' not in df.columns or 'location' not in df.columns:
         return df
@@ -129,24 +148,49 @@ def reindex_daily_calendar(df):
     df['date'] = pd.to_datetime(df['date'])
     
     dfs = []
+    total_gaps_filled = 0
+
     for loc, group in df.groupby('location'):
         group = group.sort_values('date').drop_duplicates(subset=['date'])
         full_idx = pd.date_range(group['date'].min(), group['date'].max(), freq='D')
+        gap_count = len(full_idx) - len(group)
+        total_gaps_filled += gap_count
+        
         group = group.set_index('date').reindex(full_idx)
         group['location'] = loc
+        
         if 'new_cases' in group.columns:
-            group['new_cases'] = group['new_cases'].fillna(0.0)
+            if fill_strategy == 'zero':
+                group['new_cases'] = group['new_cases'].fillna(0.0)
+            elif fill_strategy == 'interpolate':
+                group['new_cases'] = group['new_cases'].interpolate(method='linear').clip(lower=0.0)
+            elif fill_strategy == 'ffill':
+                group['new_cases'] = group['new_cases'].ffill().fillna(0.0)
+            else:
+                raise ValueError(f"Unknown fill_strategy: '{fill_strategy}'. Expected 'zero', 'interpolate', or 'ffill'.")
+
         for col in ['total_cases', 'population', 'stringency_index', 'total_deaths']:
             if col in group.columns:
                 group[col] = group[col].ffill().fillna(0.0)
+                
         group = group.reset_index().rename(columns={'index': 'date'})
         dfs.append(group)
+
+    if emit_warning and total_gaps_filled > 0:
+        warnings.warn(
+            f"Surveillance gap notice: {total_gaps_filled} missing calendar dates were detected and "
+            f"handled using fill_strategy='{fill_strategy}'. Epidemiological justification: Unreported dates "
+            f"are treated under the official registry confirmation model, but may reflect administrative "
+            f"reporting delays rather than true zero transmission.",
+            UserWarning,
+            stacklevel=2
+        )
         
     return pd.concat(dfs, ignore_index=True).sort_values(['location', 'date'])
 
 
 # 3. إنشاء الميزات وهندستها
-def create_features(df):
+def create_features(df, drop_na=True):
     """
     إنشاء ميزات الفارق الزمني (Lag features) والمتوسطات المتحركة (Rolling Averages)
     الخالية تماماً من تسريب البيانات المستهدفة أو الزمنية (Target & Temporal Leakage-Free).
@@ -183,9 +227,71 @@ def create_features(df):
             df[f'lag_{lag}'] = df['new_cases'].shift(lag)
             df[f'rolling_avg_{lag}'] = df['new_cases'].shift(1).rolling(lag, min_periods=1).mean()
         
-    df = df.dropna()
-    df['target'] = np.log1p(df['new_cases'])
+    if drop_na:
+        df = df.dropna()
+        df['target'] = np.log1p(df['new_cases'])
+    else:
+        features = ['lag_1', 'lag_7', 'rolling_avg_1', 'rolling_avg_7']
+        if 'total_cases' in df.columns:
+            features.append('total_cases')
+        if 'stringency_index' in df.columns:
+            features.append('stringency_index')
+        df = df.dropna(subset=features)
+        if 'new_cases' in df.columns:
+            df['target'] = np.where(df['new_cases'].notna(), np.log1p(df['new_cases'].clip(lower=0)), np.nan)
+            
     return df
+
+
+def construct_forecast_origin_features(df, country=None, target_date=None):
+    """
+    بناء صف الميزات الخاص بلحظة التنبؤ الحقيقية T -> للتنبؤ باليوم T+1
+    بالاعتماد حصرياً على الملاحظات التاريخية المتاحة حتى التاريخ T دون استخدام
+    أي مشاهدة أو قيمة مستهدفة لليوم T+1.
+    
+    Construct the true one-step-ahead feature row for forecast origin T -> predicting T+1,
+    strictly using observations available up to date T.
+    No observation, measurement, or target for date T+1 is required or accessed.
+    Exercises the exact same feature engineering pipeline (create_features) as the application.
+    """
+    df = df.copy()
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
+        
+    if country is not None and 'location' in df.columns:
+        df = df[df['location'] == country].copy()
+        
+    if 'location' in df.columns:
+        df = df.sort_values(['location', 'date'])
+    else:
+        df = df.sort_values('date')
+        
+    future_rows = []
+    locations = df['location'].unique() if 'location' in df.columns else [None]
+    
+    for loc in locations:
+        sub = df[df['location'] == loc] if loc is not None else df
+        last_row = sub.iloc[-1]
+        t_plus_1 = pd.to_datetime(target_date) if target_date is not None else last_row['date'] + pd.Timedelta(days=1)
+        
+        row_dict = {
+            'date': t_plus_1,
+            'new_cases': np.nan,  # Target observation at T+1 is strictly unknown
+        }
+        if loc is not None:
+            row_dict['location'] = loc
+        for col in ['population', 'total_cases', 'stringency_index', 'total_deaths']:
+            if col in sub.columns:
+                row_dict[col] = last_row[col]
+            
+        future_rows.append(row_dict)
+        
+    combined = pd.concat([df, pd.DataFrame(future_rows)], ignore_index=True)
+    feat_df = create_features(combined, drop_na=False)
+    
+    future_features = feat_df[feat_df['new_cases'].isna()].copy()
+    future_features = future_features.drop(columns=['new_cases', 'target'], errors='ignore')
+    return future_features
 
 
 # 4. نماذج خط الأساس (Baselines)

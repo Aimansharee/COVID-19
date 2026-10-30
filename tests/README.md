@@ -13,6 +13,7 @@ tests/
 ├── test_data_loading.py       # اختبارات تحميل البيانات ومعالجة المسارات والملفات المفقودة
 ├── test_data_validation.py    # التحقق من صحة واكتمال البيانات الوبائية وعدم وجود قيم سالبة
 ├── test_preprocessing.py      # اختبارات تنظيف البيانات، القيم الشاذة، وهندسة الخصائص الزمنية
+├── test_leakage_and_baselines.py # اختبارات منع تسريب البيانات ونماذج خط الأساس وعزل لحظة التنبؤ
 ├── test_models.py             # اختبارات بناء وتهيئة نموذج Gradient Boosting Regressor
 ├── test_model_prediction.py   # اختبارات التنبؤ الفردي والدفعات والتحويل العكسي expm1
 ├── test_model_evaluation.py   # اختبارات مقاييس الأداء (MAE, RMSE, R2, Adjusted SMAPE)

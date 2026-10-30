@@ -18,7 +18,8 @@ from main import (
     predict_naive_persistence,
     predict_moving_average,
     check_date_continuity,
-    reindex_daily_calendar
+    reindex_daily_calendar,
+    construct_forecast_origin_features
 )
 
 
@@ -472,4 +473,175 @@ def test_outbreak_peak_preservation():
     # The true maximum peak (5000.0) must be fully retained in the series
     assert feat_df["new_cases"].max() == 5000.0
     assert len(clean_df) == 20
+
+
+def test_true_forecast_origin_without_future_observations():
+    """
+    True Forecast-Origin Test:
+    The available dataset ends strictly at date T.
+    Construct the feature row for T+1 without using any T+1 observation or target.
+    Verify that:
+    1. The input dataset has NO observations, measurements, or target for date T+1.
+    2. The constructed feature row for T+1 contains only features computed from history <= T:
+       lag_1 == new_cases[T]
+       lag_7 == new_cases[T-6]
+       rolling_avg_1 == new_cases[T]
+       rolling_avg_7 == mean(new_cases[T-6:T+1])
+       total_cases == total_cases[T]
+       population == population[T]
+       stringency_index == stringency_index[T]
+    3. The model and baselines can predict T+1 successfully from this isolated feature row.
+    """
+    dates_through_T = pd.date_range("2021-01-01", periods=20, freq="D")
+    base_cases = [float(100 + i * 5) for i in range(20)]
+    
+    # Dataset ends strictly at index 19 (date T: 2021-01-20). There is NO day 21 (T+1).
+    df_through_T = pd.DataFrame({
+        "location": ["OriginLand"] * 20,
+        "date": dates_through_T,
+        "new_cases": base_cases,
+        "total_cases": np.cumsum(base_cases),
+        "population": [2000000.0] * 20,
+        "stringency_index": [45.0] * 20
+    })
+    
+    date_T = dates_through_T[-1]
+    expected_T_plus_1 = date_T + pd.Timedelta(days=1)
+    
+    # Verify dataset strictly ends at T
+    assert df_through_T["date"].max() == date_T
+    assert (df_through_T["date"] == expected_T_plus_1).sum() == 0
+    
+    # Construct feature row for T+1 strictly using data up to T
+    feat_row_T_plus_1 = construct_forecast_origin_features(df_through_T, country="OriginLand")
+    
+    assert len(feat_row_T_plus_1) == 1
+    row = feat_row_T_plus_1.iloc[0]
+    
+    assert row["date"] == expected_T_plus_1
+    assert "new_cases" not in feat_row_T_plus_1.columns
+    assert "target" not in feat_row_T_plus_1.columns
+    
+    # Verify feature mathematics strictly match history <= T
+    # lag_1 of T+1 is cases at T (day 20: 100 + 19*5 = 195.0)
+    assert np.isclose(row["lag_1"], 195.0)
+    assert np.isclose(row["rolling_avg_1"], 195.0)
+    
+    # lag_7 of T+1 is cases at T-6 (day 14: 100 + 13*5 = 165.0)
+    assert np.isclose(row["lag_7"], 165.0)
+    
+    # rolling_avg_7 of T+1 is mean of days 14..20: 165, 170, 175, 180, 185, 190, 195 -> mean = 180.0
+    expected_7day_rolling = float(np.mean([165.0, 170.0, 175.0, 180.0, 185.0, 190.0, 195.0]))
+    assert np.isclose(row["rolling_avg_7"], expected_7day_rolling)
+    
+    # total_cases at T+1 is cumulative total at T
+    assert np.isclose(row["total_cases"], sum(base_cases))
+    assert np.isclose(row["stringency_index"], 45.0)
+    assert np.isclose(row["population"], 2000000.0)
+    
+    # Train model on historical features and predict on isolated T+1 feature row
+    features = ['lag_1', 'lag_7', 'rolling_avg_1', 'rolling_avg_7', 'total_cases', 'population', 'stringency_index']
+    historical_feats = create_features(df_through_T)
+    model = build_model(n_estimators=10, max_depth=3, random_state=42)
+    model.fit(historical_feats[features], historical_feats['target'])
+    
+    pred_log = model.predict(feat_row_T_plus_1[features])
+    pred_cases = np.expm1(pred_log)[0]
+    assert not np.isnan(pred_cases)
+    assert pred_cases > 0
+    
+    # Baselines also predict cleanly from the isolated feature row
+    naive_pred = predict_naive_persistence(feat_row_T_plus_1)[0]
+    ma_pred = predict_moving_average(feat_row_T_plus_1, window=7)[0]
+    assert np.isclose(naive_pred, 195.0)
+    assert np.isclose(ma_pred, 180.0)
+
+
+def test_forecast_origin_pipeline_consistency():
+    """
+    Verify that construct_forecast_origin_features exercises the identical forecasting pipeline
+    as create_features: when a subsequent observation at T+1 is revealed, the features constructed
+    at forecast origin T match 100% with the features computed retrospectively by create_features.
+    """
+    dates = pd.date_range("2021-01-01", periods=25, freq="D")
+    base_cases = [float(50 + i * 4) for i in range(25)]
+    full_df = pd.DataFrame({
+        "location": ["ConsistencyLand"] * 25,
+        "date": dates,
+        "new_cases": base_cases,
+        "total_cases": np.cumsum(base_cases),
+        "population": [1500000.0] * 25,
+        "stringency_index": [50.0] * 25
+    })
+    
+    # Let cutoff T be index 19
+    df_through_T = full_df.iloc[:20].copy()
+    date_T_plus_1 = dates[20]
+    
+    # Step A: Construct feature row at forecast origin T with NO future observation
+    origin_feat_row = construct_forecast_origin_features(df_through_T, country="ConsistencyLand", target_date=date_T_plus_1)
+    
+    # Step B: Compute features retrospectively using full_df including T+1
+    retrospective_feats = create_features(full_df)
+    retrospective_row_T_plus_1 = retrospective_feats[retrospective_feats["date"] == date_T_plus_1]
+    
+    features = ['lag_1', 'lag_7', 'rolling_avg_1', 'rolling_avg_7', 'total_cases', 'population', 'stringency_index']
+    for f in features:
+        origin_val = float(origin_feat_row[f].iloc[0])
+        retro_val = float(retrospective_row_T_plus_1[f].iloc[0])
+        assert np.isclose(origin_val, retro_val, atol=1e-6), (
+            f"Pipeline divergence on feature {f}! Origin: {origin_val}, Retrospective: {retro_val}"
+        )
+
+
+def test_reindex_daily_calendar_justified_zero_with_warning():
+    """
+    Verify that missing calendar dates filled with zero emit an explicit, documented UserWarning
+    rather than silently interpreting unreported cases as zero.
+    """
+    dates = [pd.Timestamp("2021-01-01"), pd.Timestamp("2021-01-02"), pd.Timestamp("2021-01-05")]
+    df = pd.DataFrame({
+        "location": ["WarnLand"] * 3,
+        "date": dates,
+        "new_cases": [50.0, 60.0, 80.0],
+        "total_cases": [50.0, 110.0, 190.0],
+        "population": [500000.0] * 3,
+        "stringency_index": [40.0] * 3
+    })
+    
+    with pytest.warns(UserWarning, match="Surveillance gap notice: 2 missing calendar dates"):
+        reindexed = reindex_daily_calendar(df, fill_strategy='zero', emit_warning=True)
+        
+    assert len(reindexed) == 5
+    assert (reindexed["date"] == pd.Timestamp("2021-01-03")).sum() == 1
+    assert (reindexed["date"] == pd.Timestamp("2021-01-04")).sum() == 1
+    assert reindexed.loc[reindexed["date"] == pd.Timestamp("2021-01-03"), "new_cases"].values[0] == 0.0
+
+
+def test_reindex_daily_calendar_interpolation_strategy():
+    """
+    Verify that fill_strategy='interpolate' smoothly distributes unreported cases
+    across a reporting gap without artificial zero-dips.
+    """
+    # 2021-01-01 has 100 cases, Jan 02-03 missing, 2021-01-04 has 130 cases
+    dates = [pd.Timestamp("2021-01-01"), pd.Timestamp("2021-01-04")]
+    df = pd.DataFrame({
+        "location": ["InterpLand"] * 2,
+        "date": dates,
+        "new_cases": [100.0, 130.0],
+        "total_cases": [100.0, 230.0],
+        "population": [500000.0] * 2,
+        "stringency_index": [40.0] * 2
+    })
+    
+    reindexed = reindex_daily_calendar(df, fill_strategy='interpolate', emit_warning=False)
+    assert len(reindexed) == 4
+    
+    jan_2 = reindexed[reindexed["date"] == pd.Timestamp("2021-01-02")].iloc[0]
+    jan_3 = reindexed[reindexed["date"] == pd.Timestamp("2021-01-03")].iloc[0]
+    
+    # 100.0 to 130.0 over 3 intervals -> step of 10.0 per day: Jan 2 = 110.0, Jan 3 = 120.0
+    assert np.isclose(jan_2["new_cases"], 110.0)
+    assert np.isclose(jan_3["new_cases"], 120.0)
+
 

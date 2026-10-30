@@ -22,6 +22,8 @@ This document catalogs all defects, design flaws, performance bottlenecks, and d
 | **BUG-012** | **High** | Temporal Leakage | Contemporaneous Cumulative Totals and Oxford Policy Scores | **FIXED & VERIFIED** |
 | **BUG-013** | **High** | Preprocessing Leakage | Global Outlier Filtering Across Folds & Outbreak Peak Truncation | **FIXED & VERIFIED** |
 | **BUG-014** | **Medium** | Forecasting Integrity | Absence of Empirical Time-Series Baseline Benchmarks | **FIXED & VERIFIED** |
+| **BUG-015** | **High** | Operational Forecasting | Absence of Forecast-Origin ($T+1$) Construction Without Future Targets | **FIXED & VERIFIED** |
+| **BUG-016** | **Medium** | Data Quality / Epidemiology | Silent Assumption of Zero Cases on Unreported Calendar Dates | **FIXED & VERIFIED** |
 
 ---
 
@@ -251,3 +253,28 @@ This document catalogs all defects, design flaws, performance bottlenecks, and d
 - **Applied Fix**: Created baseline model classes and integrated comparative evaluation tables into Streamlit UI and test suites.
 - **Regression Test**: `tests/test_leakage_and_baselines.py::test_naive_persistence_baseline_behavior`, `test_moving_average_baseline_behavior`, `test_comparable_model_evaluation_periods`
 - **Status**: **FIXED & VERIFIED**
+
+---
+
+### BUG-015: Absence of Strict Forecast-Origin Feature Construction Without Future Observations ($T+1$)
+- **Bug ID**: `BUG-015`
+- **Severity**: **High**
+- **Affected File**: `main.py` (`construct_forecast_origin_features`, `create_features`)
+- **Root Cause**: The standard `create_features()` pipeline relied on dropping rows where `new_cases` was missing (`dropna()`), requiring an observed target row at $T+1$ to construct features for $T+1$. In real-world operational forecasting where the dataset ends strictly at date $T$, there is no observation for $T+1$.
+- **Expected Behavior**: Provide an explicit forecast-origin construction procedure that builds the exact feature row for $T+1$ strictly from observations $\le T$, without accessing or requiring any target observation at $T+1$, exercising the exact same transformation pipeline.
+- **Applied Fix**: Updated `create_features(df, drop_na=True)` to support `drop_na=False`, and introduced `construct_forecast_origin_features(df, country=None, target_date=None)` to construct out-of-sample $T+1$ feature vectors cleanly without target observations.
+- **Regression Test**: `tests/test_leakage_and_baselines.py::test_true_forecast_origin_without_future_observations`, `test_forecast_origin_pipeline_consistency`
+- **Status**: **FIXED & VERIFIED**
+
+---
+
+### BUG-016: Silent Assumption of Zero Cases on Unreported Calendar Dates
+- **Bug ID**: `BUG-016`
+- **Severity**: **Medium**
+- **Affected File**: `main.py` (`reindex_daily_calendar`, `preprocess_data`)
+- **Root Cause**: Calendar reindexing silently imputed `0.0` for missing dates without notifying the user or documenting the epidemiological implications. In real surveillance feeds, missing dates often represent weekend administrative backlogs rather than actual zero infections, which creates artificial weekly drop-offs followed by batch-reporting spikes.
+- **Expected Behavior**: Do not silently impute zero cases. Provide explicit epidemiological justification and documentation, emit an informative warning notice when gaps are encountered, and support alternative strategies like linear interpolation (`fill_strategy='interpolate'`).
+- **Applied Fix**: Enhanced `reindex_daily_calendar(df, fill_strategy='zero', emit_warning=True)` with explicit epidemiological docstrings, `UserWarning` logging of detected gaps and strategy justification, and full linear interpolation support.
+- **Regression Test**: `tests/test_leakage_and_baselines.py::test_reindex_daily_calendar_justified_zero_with_warning`, `test_reindex_daily_calendar_interpolation_strategy`
+- **Status**: **FIXED & VERIFIED**
+
