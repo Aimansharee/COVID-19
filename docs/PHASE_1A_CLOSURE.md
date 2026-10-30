@@ -1,17 +1,18 @@
 # 📋 COVID-19 AI — Phase 1A Final Closure & Independent Code Review Dossier
 
-**Document Version**: 1.0.0  
-**Date**: October 29, 2026  
+**Document Version**: 1.1.0  
+**Date**: October 30, 2026  
 **Auditor & Specialist**: Senior Time-Series Machine Learning Engineer, Python Specialist & QA Automation Lead  
-**Scope**: Phase 1A Final Closure, Feature Integrity Verification & GitHub Synchronization  
-**Final Test Status**: **60 / 60 Tests Passed (100%)** | **Code Coverage: 94%**  
-**Dedicated Review Branch**: `review/phase-1a-closure`  
+**Scope**: Phase 1A Final Closure, Feature Integrity Verification, Git History Reconciliation & Integration  
+**Final Test Status**: **64 / 64 Tests Passed (100%)** | **Code Coverage: 94%**  
+**Integration Branch**: `integration/phase-1a-main`  
+**Review Branch**: `review/phase-1a-closure`  
 
 ---
 
 ## 1. Executive Summary & Reviewer Findings
 
-During the Phase 1A independent code audit and subsequent verification, the forecasting pipeline in [main.py](file:///f:/covid-19/main.py) underwent rigorous validation against data leakage, temporal contamination, and empirical baseline standards.
+During the Phase 1A independent code audit, Git history reconciliation, and final verification, the forecasting pipeline in [main.py](file:///f:/covid-19/main.py) underwent rigorous validation against data leakage, temporal contamination, empirical baseline standards, and operational forecast-origin isolation.
 
 ### Reviewer Findings & Verification Matrix
 
@@ -21,9 +22,9 @@ During the Phase 1A independent code audit and subsequent verification, the fore
 | **Rolling Window Overlap** | `rolling_avg_7` included contemporaneous day $t$ as the 7th element of the mean. | **VERIFIED RESOLVED**: Trailing window converted to `new_cases.shift(1).rolling(7).mean()`, incorporating strictly past dates $t-7 \dots t-1$. Tested in `test_shifted_rolling_averages_use_only_past_observations`. |
 | **Contemporaneous Covariates** | `total_cases` and `stringency_index` were supplied at step $t$, leaking same-day cumulative counts and policy changes. | **VERIFIED RESOLVED**: Applied `shift(1)` to both variables per country group. Tested in `test_contemporaneous_cumulative_and_stringency_lagged`. |
 | **Global Outlier Preprocessing** | Quantiles (5%–95%) were calculated globally across all countries and future dates, deleting 70% of days for the US and truncating outbreak peaks. | **VERIFIED RESOLVED**: Defaulted `filter_outliers=False` for continuous time-series; created `fit_outlier_bounds` and `apply_outlier_bounds` for training-only threshold estimation. Tested in `test_training_only_preprocessing_outlier_bounds` and `test_outbreak_peak_preservation`. |
-| **Calendar Discontinuity & Date Gaps** | Missing dates in raw data could cause `shift(1)` to skip across multi-day intervals. | **VERIFIED RESOLVED**: Created `check_date_continuity()` and `reindex_daily_calendar()` to detect and fill calendar gaps with 0 cases and forward-filled cumulative figures. Tested in `test_missing_dates_detection_and_reindexing`. |
+| **Calendar Discontinuity & Date Gaps** | Missing dates in raw data could cause `shift(1)` to skip across multi-day intervals. | **VERIFIED RESOLVED**: Created `check_date_continuity()` and `reindex_daily_calendar()` supporting documented `'zero'`, `'interpolate'`, and `'ffill'` strategies with explicit `UserWarning` notice. Tested in `test_missing_dates_detection_and_reindexing`, `test_reindex_daily_calendar_justified_zero_with_warning`, and `test_reindex_daily_calendar_interpolation_strategy`. |
 | **Multi-Country Interleaving** | Arbitrary or shuffled record orders could bleed cross-country values during shifting. | **VERIFIED RESOLVED**: Enforced explicit datetime conversion and sorting by `['location', 'date']` before all lag and rolling calculations. Tested in `test_chronological_sorting_on_unsorted_and_interleaved_records`. |
-| **Forecast-Origin Isolation** | Risk of historical predictions depending on future data points. | **VERIFIED RESOLVED**: Implemented realistic Forecast-Origin Isolation test verifying bit-for-bit identical predictions at $T+1$ regardless of future record availability. Tested in `test_forecast_origin_isolation_procedure`. |
+| **Operational Forecast-Origin Isolation** | Standard feature pipeline required an observed target row at $T+1$ to construct features. | **VERIFIED RESOLVED**: Implemented `construct_forecast_origin_features()` to produce exact out-of-sample $T+1$ feature vectors strictly from history $\le T$ without any target observation. Tested in `test_true_forecast_origin_without_future_observations` and `test_forecast_origin_pipeline_consistency`. |
 | **Empirical Baselines** | Absence of genuine baselines, replaced by artificial `Actual * 1.2` benchmark. | **VERIFIED RESOLVED**: Implemented `NaivePersistenceModel` ($y_t = y_{t-1}$) and `MovingAverageModel` (7-day trailing average) and benchmarked them on identical test sets. |
 
 ---
@@ -110,11 +111,11 @@ The repository documentation was thoroughly audited and reconciled:
 
 ### Full Test Suite Execution Summary
 - **Command**: `python -m pytest tests/ -v`
-- **Total Tests Collected**: **60**
-- **Passed**: **60 (100%)**
+- **Total Tests Collected**: **64**
+- **Passed**: **64 (100%)**
 - **Failed**: **0**
 - **Skipped**: **0**
-- **Execution Time**: **12.88 seconds**
+- **Execution Time**: **19.20 seconds**
 
 ### Detailed Module Breakdown
 
@@ -124,7 +125,7 @@ The repository documentation was thoroughly audited and reconciled:
 | `tests/test_data_loading.py` | 4 | **PASSED** | Default CSV loading, vaccine data loader, missing file fallbacks |
 | `tests/test_data_validation.py` | 6 | **PASSED** | Schema types, negative checks, population sanity, uniqueness |
 | `tests/test_imports.py` | 9 | **PASSED** | Python 3.9+, core packages, `main.py` public API exports |
-| `tests/test_leakage_and_baselines.py` | 14 | **PASSED** | No target leakage, shifted windows, lagged totals, mutation invariance, training-only outlier bounds, chronological isolation, baselines, missing dates, interleaved sorting, origin isolation, peak preservation |
+| `tests/test_leakage_and_baselines.py` | 18 | **PASSED** | No target leakage, shifted windows, lagged totals, mutation invariance, training-only outlier bounds, chronological isolation, baselines, missing dates with warnings, linear interpolation, interleaved sorting, origin isolation, peak preservation, true forecast origin without T+1 targets, and pipeline consistency |
 | `tests/test_model_evaluation.py` | 4 | **PASSED** | Adjusted SMAPE edge cases, evaluate_predictions metrics |
 | `tests/test_model_prediction.py` | 1 | **PASSED** | Single and batch inference, non-negative expm1 transformations |
 | `tests/test_models.py` | 2 | **PASSED** | Huber loss hyperparameter checks, model training smoke test |
@@ -135,47 +136,31 @@ The repository documentation was thoroughly audited and reconciled:
 
 ### Code Coverage Analysis
 - **Command**: `python -m pytest tests/ --cov=main --cov-report=term-missing`
-- **Coverage**: **94%** (308 / 327 statements executed)
-- **Uncovered lines**: Exclusively rare defensive exception handlers and fallback branches.
+- **Coverage**: **94%** (351 / 374 statements executed)
+- **Uncovered lines**: Exclusively defensive fallback clauses and CLI help paths.
 
 ---
 
-## 6. Git Repository, Commit History & Review Branch (Phases A, B, H, I)
+## 6. Git History Reconciliation & Integration Branch
 
-### Git Repository State (Phase A)
-- **Working Directory**: `F:\covid-19`
-- **Git Initialization**: The directory was an unversioned project workspace without an existing `.git` directory. Git was initialized locally (`git init -b main`).
-- **Remotes Checked**: `git remote -v` confirmed **no remote repository configured**.
-- **User Config**: `user.name=aimansharee`, `user.email=109242982+Aimansharee@users.noreply.github.com`.
-- **Pre-existing Uncommitted Files**: Fully preserved without deletion or overwriting.
+### Git History Reconciliation Strategy
+To safely merge the independent root histories (`origin/main` at `062e3c0` and local root at `76bd023`) without losing any commit hashes or rewriting history:
+1. Created dedicated integration branch `integration/phase-1a-main` tracked to `origin/main`.
+2. Executed non-destructive merge: `git merge origin/review/phase-1a-closure --allow-unrelated-histories --no-commit`.
+3. Resolved `README.md` conflict by preserving the full documentation from `review/phase-1a-closure`.
+4. Finalized merge commit `2ebe423d5ec0a442241f8c6cccf75e6710601462` connecting both parents.
+5. Implemented and verified true forecast-origin pipeline and documented missing-date surveillance (commit `9e55fa0e6a394a48e77ce71bb76ba54589255a82`).
+6. Pushed to `origin/integration/phase-1a-main`. The target branch `main` remains untouched at `062e3c0`.
 
-### Dedicated Review Branch (Phase B)
-- **Branch**: `review/phase-1a-closure`
-
-### Commit History (Phase H)
-The verified changes were organized into logically grouped, descriptive commits:
-1. `chore: establish initial baseline repository snapshot`
-2. `fix: eliminate target leakage and implement empirical baselines`
-3. `test: add chronological integrity and forecast-origin isolation tests`
-4. `docs: reconcile Phase 1A bug and testing reports`
-5. `docs: finalize Phase 1A closure evidence`
-
-### Remote Publication Status (Phase I)
-- **Remote Repository URL**: [https://github.com/Aimansharee/COVID-19](https://github.com/Aimansharee/COVID-19)
-- **Remote Tracking Branch**: `origin/review/phase-1a-closure`
-- **Publication Status**: **SUCCESSFULLY PUBLISHED**
-- **Pull Request / Compare URL**: [https://github.com/Aimansharee/COVID-19/compare/main...review/phase-1a-closure](https://github.com/Aimansharee/COVID-19/compare/main...review/phase-1a-closure)
-
-### Commit Hashes on Review Branch
-- `7e0f829792274f538018379746897e38d03df9b9` — `docs: finalize Phase 1A closure evidence`
-- `2a40d884a004aba992b8591659077bd6915b4346` — `docs: reconcile Phase 1A bug and testing reports`
-- `8670c0a859f8694be342a8276f62837c7de7a0b4` — `test: add chronological and forecast-origin isolation tests`
-- `ec38a44a1c215987d34a75961592ebd810e346d8` — `fix: correct remaining temporal data handling issues and eliminate target leakage`
-- `76bd0232f183d9b2a760f56c274d3593ca76783f` — `chore: initial baseline repository structure`
+### Active Remote Branches
+- **Integration Branch**: [`integration/phase-1a-main`](https://github.com/Aimansharee/COVID-19/tree/integration/phase-1a-main)
+- **Review Branch**: [`review/phase-1a-closure`](https://github.com/Aimansharee/COVID-19/tree/review/phase-1a-closure)
+- **Target Release Branch**: `main` (holding at `062e3c0` pending final user PR merge)
+- **Pull Request Creation URL**: [https://github.com/Aimansharee/COVID-19/pull/new/integration/phase-1a-main](https://github.com/Aimansharee/COVID-19/pull/new/integration/phase-1a-main)
 
 ---
 
-## 7. Remaining Technical Limitations & Handover Notes
+## 7. Remaining Technical Limitations & Phase 1B Handover Notes
 
 1. **Extrapolation Ceiling in Gradient Boosting Regressor**:
    Decision trees cannot extrapolate values higher than the maximum target observed in the training distribution. During unprecedented epidemic acceleration (such as the winter 2021 Omicron surge), the GBR flat-tops at historical training limits. This explains why the **7-Day Trailing Moving Average Baseline** outperformed GBR in the US ($R^2 = 0.7078$ vs $0.0522$).
@@ -183,6 +168,10 @@ The verified changes were organized into logically grouped, descriptive commits:
    Weekly reporting cycles cause weekend dips and weekday catch-up spikes. While the 7-day moving average smooths these fluctuations, explicit cyclical day-of-week encoding should be considered in Phase 1B.
 3. **Single-Step Horizon ($t \to t+1$)**:
    The current pipeline is strictly 1-day ahead. Multi-horizon iterative forecasting will be addressed in future phases.
+4. **`construct_forecast_origin_features()` Status & UI Exposure**:
+   The helper function `construct_forecast_origin_features()` in `main.py` is fully verified and mathematically isolated for constructing $T+1$ feature vectors strictly from history $\le T$. However, in Phase 1A, this helper is an internal programmatic pipeline component and is **not yet exposed as an interactive future-forecast action/button in the Streamlit UI** (the current UI evaluates the train/test historical split). Interactive out-of-sample forward forecasting and dedicated UI widgets are strictly scheduled for **Phase 1B**.
+5. **Epidemiological Limitations of `fill_strategy='zero'`**:
+   While `reindex_daily_calendar(fill_strategy='zero')` conforms to an official registry "event-of-report" accounting convention, viral transmission does not pause on weekends or holidays. Filling missing reporting dates with zero creates artificial weekend dips and compensatory batch-reporting spikes. Users and researchers requiring smooth transmission dynamics should employ `fill_strategy='interpolate'`, which is implemented and fully tested.
 
 ---
 
@@ -194,14 +183,16 @@ The verified changes were organized into logically grouped, descriptive commits:
 - [x] Authentic epidemiological outbreak peaks preserved (`filter_outliers=False`).
 - [x] Chronological feature integrity verified (calendar continuity, country isolation, sorting).
 - [x] Realistic Forecast-Origin Isolation test verified with bit-for-bit invariance.
+- [x] True forecast-origin feature builder (`construct_forecast_origin_features`) implemented and tested without $T+1$ targets.
+- [x] Non-silent surveillance gap reporting with `UserWarning` and interpolation support implemented.
 - [x] Empirical Naive Persistence and 7-Day Moving Average baselines implemented and benchmarked.
 - [x] Documentation reconciled across `BUG_REPORT.md`, `BASELINE_REPORT.md`, and `PHASE_1A_REPORT.md`.
-- [x] Full automated test suite passes (60/60 tests, 100%).
+- [x] Full automated test suite passes (64/64 tests, 100%).
 - [x] Test coverage at 94%.
-- [x] Clean Git commit history structured on `review/phase-1a-closure`.
-- [x] Published to remote GitHub review branch `origin/review/phase-1a-closure`.
+- [x] Unrelated Git histories safely reconciled onto `integration/phase-1a-main`.
+- [x] Target branch `main` strictly preserved and unchanged.
 - [x] Handover dossier prepared for independent code review.
 
 ---
 
-**PHASE 1A CLOSURE COMPLETE — PUBLISHED FOR INDEPENDENT REVIEW**
+**PHASE 1A CLOSURE COMPLETE — READY FOR FINAL REVIEW**
