@@ -418,6 +418,403 @@ def evaluate_predictions(y_true, y_pred):
     }
 
 
+# 7. التنبؤ التكراري متعدد الآفاق (Multi-Horizon Recursive Forecasting Engine)
+def forecast_recursive(
+    model,
+    historical_df,
+    country,
+    horizon=7,
+    features=None,
+    is_log_target=None,
+    fill_strategy='zero',
+    model_name=None
+):
+    """
+    Generate a fixed-origin multi-horizon recursive forecast trajectory for daily COVID-19 cases.
+    
+    Epidemiological & Methodological Principles:
+    -------------------------------------------
+    1. Strict Forecast-Origin Isolation: Only observations available through origin date T are utilized.
+       No actual future target observations or policy changes are accessed during trajectory generation.
+    2. Synthetic Forecast Observations: For step h=1 (T+1), features are constructed from historical data <= T.
+       The model predicts y_hat_{T+1}. This prediction is appended as a synthetic forecast observation.
+       For step h=2 (T+2), features are constructed using history <= T plus y_hat_{T+1}.
+       This recursive progression continues through T+horizon.
+    3. Future Covariate Assumptions:
+       - 'population': Held constant at the last historically available observation at T.
+       - 'stringency_index': Held constant at the last available observation at T (explicit policy freeze scenario).
+       - 'total_cases': Maintained as a scenario cumulative count: Total_Cases(T+h) = Total_Cases(T) + sum(y_hat_{T+1..T+h}).
+         Correctly accounts for the 1-day lag shift in create_features to avoid double shifting.
+    4. Prediction Safety:
+       - Expm1 inverse transform applied only when model outputs log-scale targets (is_log_target=True).
+       - Nonnegative clipping: All predicted counts are clipped to >= 0.0.
+       - Finite value enforcement: NaN and Infinite predictions trigger an immediate ValueError.
+       - Historical input immutability: Input historical_df is deep-copied and never mutated.
+    
+    Parameters:
+    -----------
+    model : object
+        Fitted forecasting model (e.g. GradientBoostingRegressor, NaivePersistenceModel, MovingAverageModel).
+    historical_df : pd.DataFrame
+        Historical dataset containing daily COVID-19 records through forecast origin date T.
+    country : str
+        Country name for which the forecast trajectory is generated.
+    horizon : int, default 7
+        Forecasting horizon in days (e.g. 7, 14, 30).
+    features : list of str, optional
+        Feature column names expected by model.predict(). Defaults to:
+        ['lag_1', 'lag_7', 'rolling_avg_1', 'rolling_avg_7', 'total_cases', 'population', 'stringency_index'].
+    is_log_target : bool, optional
+        Whether the model outputs log1p-transformed targets requiring expm1().
+        If None, automatically detected: False for NaivePersistenceModel and MovingAverageModel, True otherwise.
+    fill_strategy : str, default 'zero'
+        Imputation strategy for missing calendar dates in historical_df ('zero', 'interpolate', 'ffill').
+    model_name : str, optional
+        Human-readable model name. Defaults to model.__class__.__name__.
+        
+    Returns:
+    --------
+    pd.DataFrame
+        Structured forecast trajectory with columns:
+        ['country', 'origin_date', 'target_date', 'horizon_step', 'model_name', 'predicted_cases']
+    """
+    if not isinstance(historical_df, pd.DataFrame):
+        raise TypeError("historical_df must be a pandas DataFrame.")
+    if not isinstance(horizon, (int, np.integer)) or horizon < 1:
+        raise ValueError(f"horizon must be a positive integer, got {horizon}.")
+    if country is None:
+        raise ValueError("country must be specified.")
+
+    working_df = historical_df.copy(deep=True)
+    if 'location' in working_df.columns:
+        working_df = working_df[working_df['location'] == country].copy()
+    if len(working_df) == 0:
+        raise ValueError(f"No historical records found for country: '{country}'.")
+
+    if 'date' not in working_df.columns or 'new_cases' not in working_df.columns:
+        raise ValueError("historical_df must contain 'date' and 'new_cases' columns.")
+
+    working_df['date'] = pd.to_datetime(working_df['date'])
+    working_df = working_df.sort_values('date').reset_index(drop=True)
+
+    is_continuous, _ = check_date_continuity(working_df)
+    if not is_continuous:
+        working_df = reindex_daily_calendar(working_df, fill_strategy=fill_strategy, emit_warning=False)
+
+    min_required_history = 8  # Need 7 historical days for lag_7/rolling_avg_7 plus origin date T
+    if len(working_df) < min_required_history:
+        raise ValueError(
+            f"Insufficient history for country '{country}'. "
+            f"Minimum {min_required_history} consecutive daily observations required, got {len(working_df)}."
+        )
+
+    if 'total_cases' not in working_df.columns:
+        working_df['total_cases'] = working_df['new_cases'].cumsum()
+    if 'population' not in working_df.columns:
+        working_df['population'] = 1000000.0
+    if 'stringency_index' not in working_df.columns:
+        working_df['stringency_index'] = 0.0
+
+    if model_name is None:
+        model_name = getattr(model, 'name', model.__class__.__name__)
+
+    if is_log_target is None:
+        if isinstance(model, (NaivePersistenceModel, MovingAverageModel)) or getattr(model, 'is_log_target', None) is False:
+            apply_expm1 = False
+        elif 'naive' in model_name.lower() or 'moving' in model_name.lower() or 'average' in model_name.lower():
+            apply_expm1 = False
+        else:
+            apply_expm1 = True
+    else:
+        apply_expm1 = bool(is_log_target)
+
+    if features is None:
+        features = ['lag_1', 'lag_7', 'rolling_avg_1', 'rolling_avg_7', 'total_cases', 'population', 'stringency_index']
+
+    origin_date = working_df['date'].iloc[-1]
+    forecast_records = []
+
+    for h in range(1, horizon + 1):
+        target_date = origin_date + pd.Timedelta(days=h)
+
+        feat_row = construct_forecast_origin_features(working_df, country=country, target_date=target_date)
+
+        missing_feats = [f for f in features if f not in feat_row.columns]
+        if missing_feats:
+            raise ValueError(f"Missing required feature(s) for prediction: {missing_feats}")
+
+        X_step = feat_row[features]
+
+        raw_pred = model.predict(X_step)
+        raw_scalar = float(np.asarray(raw_pred).ravel()[0])
+
+        if np.isnan(raw_scalar) or np.isinf(raw_scalar):
+            raise ValueError(
+                f"Model '{model_name}' produced non-finite raw prediction ({raw_scalar}) "
+                f"at horizon step {h} ({target_date.strftime('%Y-%m-%d')})."
+            )
+
+        if apply_expm1:
+            pred_cases = np.expm1(raw_scalar)
+        else:
+            pred_cases = raw_scalar
+
+        # Enforce nonnegative physical case count
+        pred_cases = max(0.0, float(pred_cases))
+
+        if np.isnan(pred_cases) or np.isinf(pred_cases):
+            raise ValueError(
+                f"Model '{model_name}' produced non-finite case prediction ({pred_cases}) "
+                f"at horizon step {h} ({target_date.strftime('%Y-%m-%d')})."
+            )
+
+        forecast_records.append({
+            'country': country,
+            'origin_date': origin_date,
+            'target_date': target_date,
+            'horizon_step': h,
+            'model_name': model_name,
+            'predicted_cases': pred_cases
+        })
+
+        # Append synthetic forecast observation to working history
+        last_row = working_df.iloc[-1]
+        prev_cumulative_total = float(last_row['total_cases'])
+        synthetic_cumulative_total = prev_cumulative_total + pred_cases
+
+        synthetic_row = {
+            'date': target_date,
+            'location': country,
+            'new_cases': pred_cases,
+            'total_cases': synthetic_cumulative_total,
+            'population': last_row['population'],
+            'stringency_index': last_row['stringency_index']
+        }
+        for col in working_df.columns:
+            if col not in synthetic_row:
+                synthetic_row[col] = last_row[col]
+
+        working_df = pd.concat([working_df, pd.DataFrame([synthetic_row])], ignore_index=True)
+
+    return pd.DataFrame(forecast_records)
+
+
+# 8. تقييم مسار التنبؤ متعدد الآفاق (Trajectory & Endpoint Evaluation)
+def evaluate_forecast_trajectory(forecast_df, actual_df):
+    """
+    Evaluate multi-horizon forecast predictions against ground truth actual observations.
+    
+    Computes both full-trajectory (steps 1 through H) and endpoint (step H only) metrics:
+    MAE, RMSE, R2, Adjusted SMAPE, number of origins, and number of evaluated target dates.
+    Also produces a per-step breakdown table.
+    """
+    if len(forecast_df) == 0:
+        raise ValueError("forecast_df cannot be empty.")
+
+    f_df = forecast_df.copy()
+    f_df['target_date'] = pd.to_datetime(f_df['target_date'])
+
+    a_df = actual_df.copy()
+    a_df['date'] = pd.to_datetime(a_df['date'])
+    loc_col = 'location' if 'location' in a_df.columns else 'country'
+
+    merged = pd.merge(
+        f_df,
+        a_df[[loc_col, 'date', 'new_cases']].rename(columns={loc_col: 'country', 'date': 'target_date', 'new_cases': 'actual_cases'}),
+        on=['country', 'target_date'],
+        how='inner'
+    )
+
+    if len(merged) == 0:
+        raise ValueError("No matching dates/countries found between forecast and actual data.")
+
+    def _calc_metrics(sub_df):
+        y_true = np.asarray(sub_df['actual_cases'], dtype=float)
+        y_pred = np.asarray(sub_df['predicted_cases'], dtype=float)
+        n_obs = len(y_true)
+        if n_obs == 0:
+            return {'MAE': np.nan, 'RMSE': np.nan, 'R2': np.nan, 'SMAPE': np.nan, 'num_origins': 0, 'num_eval_dates': 0}
+        mae = mean_absolute_error(y_true, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        # R2 is mathematically meaningful only when variance of y_true > 0 and n_obs >= 2
+        if n_obs >= 2 and np.var(y_true) > 1e-9:
+            r2 = r2_score(y_true, y_pred)
+        else:
+            r2 = np.nan
+        smape = adjusted_smape(y_true, y_pred)
+        n_origins = sub_df['origin_date'].nunique() if 'origin_date' in sub_df.columns else 1
+        return {
+            'MAE': mae,
+            'RMSE': rmse,
+            'R2': r2,
+            'SMAPE': smape,
+            'num_origins': n_origins,
+            'num_eval_dates': n_obs
+        }
+
+    trajectory_metrics = _calc_metrics(merged)
+
+    # Endpoint: maximum horizon_step in the forecast
+    max_step = merged['horizon_step'].max()
+    endpoint_sub = merged[merged['horizon_step'] == max_step]
+    endpoint_metrics = _calc_metrics(endpoint_sub)
+
+    # Per-step breakdown
+    per_step_records = []
+    for step, group in merged.groupby('horizon_step'):
+        m = _calc_metrics(group)
+        m['horizon_step'] = step
+        per_step_records.append(m)
+
+    per_step_df = pd.DataFrame(per_step_records).sort_values('horizon_step').reset_index(drop=True)
+
+    return {
+        'merged_df': merged,
+        'trajectory': trajectory_metrics,
+        'endpoint': endpoint_metrics,
+        'per_step': per_step_df
+    }
+
+
+# 9. إطار الاختبار الرجعي ذي الأصل الثابت (Fixed-Origin Backtesting Framework)
+def run_fixed_origin_backtest(
+    df,
+    country,
+    origins,
+    horizons=(7, 14, 30),
+    models_dict=None,
+    features=None,
+    filter_outliers=False,
+    model_params=None
+):
+    """
+    Fixed-origin multi-horizon backtesting framework.
+    
+    For each origin date T:
+    1. Truncates history strictly to date <= T.
+    2. Fits training-only preprocessing parameters and constructs features.
+    3. Trains model(s) on observations available through T.
+    4. Freezes trained model(s).
+    5. Recursively forecasts T+1 through T+H for each horizon H in horizons.
+    6. Joins actual ground-truth observations for T+1..T+H strictly after prediction.
+    7. Evaluates trajectory, endpoint, and per-step metrics.
+    """
+    if features is None:
+        features = ['lag_1', 'lag_7', 'rolling_avg_1', 'rolling_avg_7', 'total_cases', 'population', 'stringency_index']
+
+    if model_params is None:
+        model_params = {'n_estimators': 100, 'learning_rate': 0.05, 'max_depth': 5, 'random_state': 42}
+
+    country_df = df.copy()
+    if 'location' in country_df.columns:
+        country_df = country_df[country_df['location'] == country].copy()
+    country_df['date'] = pd.to_datetime(country_df['date'])
+    country_df = country_df.sort_values('date').reset_index(drop=True)
+    country_df = reindex_daily_calendar(country_df, fill_strategy='zero', emit_warning=False)
+
+    # Default model builders if not provided
+    if models_dict is None:
+        models_dict = {
+            'GradientBoostingRegressor': lambda: build_model(**model_params),
+            'NaivePersistence': lambda: NaivePersistenceModel(),
+            '7-Day Moving Average': lambda: MovingAverageModel(window=7)
+        }
+
+    all_forecasts = []
+
+    for origin_str in origins:
+        origin_date = pd.to_datetime(origin_str)
+        # 1. Truncate available data at T
+        historical_train = country_df[country_df['date'] <= origin_date].copy(deep=True)
+        if len(historical_train) < 8:
+            continue
+
+        # 2. Fit required preprocessing parameters using only permitted historical training data
+        if filter_outliers:
+            q_low, q_high = fit_outlier_bounds(historical_train)
+            preprocessed_train = apply_outlier_bounds(historical_train, q_low, q_high)
+        else:
+            preprocessed_train = preprocess_data(historical_train, filter_outliers=False)
+
+        train_feat = create_features(preprocessed_train, drop_na=True)
+        if len(train_feat) == 0:
+            continue
+
+        # 3. Train models on data <= T & 4. Freeze trained models
+        fitted_models = {}
+        for m_name, m_builder in models_dict.items():
+            model_inst = m_builder() if callable(m_builder) else m_builder
+            if isinstance(model_inst, (NaivePersistenceModel, MovingAverageModel)):
+                model_inst.fit(train_feat[features], historical_train['new_cases'])
+            else:
+                model_inst.fit(train_feat[features], train_feat['target'])
+            fitted_models[m_name] = model_inst
+
+        # 5. Forecast each horizon recursively
+        for horizon in horizons:
+            for m_name, model_inst in fitted_models.items():
+                f_df = forecast_recursive(
+                    model=model_inst,
+                    historical_df=historical_train,
+                    country=country,
+                    horizon=horizon,
+                    features=features,
+                    model_name=m_name
+                )
+                f_df['horizon_configured'] = horizon
+                all_forecasts.append(f_df)
+
+    if len(all_forecasts) == 0:
+        raise ValueError("No forecasts generated. Check origins and historical data sufficiency.")
+
+    combined_forecast_df = pd.concat(all_forecasts, ignore_index=True)
+
+    # 6. Reveal actual values for T+1..T+H strictly after predictions are complete & evaluate
+    summary_records = []
+    per_step_records = []
+    all_evaluated_forecasts = []
+
+    for (m_name, h_conf), group in combined_forecast_df.groupby(['model_name', 'horizon_configured']):
+        eval_res = evaluate_forecast_trajectory(group, country_df)
+        traj = eval_res['trajectory']
+        endp = eval_res['endpoint']
+
+        merged_sub = eval_res['merged_df'].copy()
+        merged_sub['horizon_configured'] = h_conf
+        all_evaluated_forecasts.append(merged_sub)
+
+        summary_records.append({
+            'Model': m_name,
+            'Horizon': f"{h_conf}-Day",
+            'Trajectory MAE': traj['MAE'],
+            'Trajectory RMSE': traj['RMSE'],
+            'Trajectory R²': traj['R2'],
+            'Trajectory SMAPE': traj['SMAPE'],
+            'Endpoint MAE': endp['MAE'],
+            'Endpoint RMSE': endp['RMSE'],
+            'Endpoint R²': endp['R2'],
+            'Endpoint SMAPE': endp['SMAPE'],
+            'Num Origins': traj['num_origins'],
+            'Evaluated Dates': traj['num_eval_dates']
+        })
+
+        for _, step_row in eval_res['per_step'].iterrows():
+            rec = dict(step_row)
+            rec['Model'] = m_name
+            rec['Horizon'] = f"{h_conf}-Day"
+            per_step_records.append(rec)
+
+    summary_df = pd.DataFrame(summary_records)
+    per_step_df = pd.DataFrame(per_step_records)
+    final_forecasts_df = pd.concat(all_evaluated_forecasts, ignore_index=True)
+
+    return {
+        'forecasts': final_forecasts_df,
+        'summary': summary_df,
+        'per_step': per_step_df
+    }
+
+
 def main():
     # صفحة إعدادات Streamlit
     st.set_page_config(page_title="COVID-19 Prediction Model", layout="wide", page_icon="🦠")
